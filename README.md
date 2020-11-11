@@ -19,7 +19,8 @@ Bash script to backup multiple folders and to clean up old backups based on a re
 * `backup_retention` = Retention time how long we should keep the backups
 * `pre_commands` = Array of commands that are executed before the backup starts (stop specific service)
 * `post_commands` = Array of commands that are executed after the backup finished (start specific service)
-
+* `backup_incremental` = Bollean (true or false) for enabling tar incremental backups based on backup_retention
+* `lv_to_snap` = Boolean (true or false) for creating a snapshot of lv and do backup from it. Sufficient space has to be provided.
 ### Environment configurations
 
 * `DEBUG` = if set to "true", `set -x` will be set
@@ -37,6 +38,12 @@ In the example below you can find a `multibackup` configuration file to backup a
 
     # Timestamp format, used in the backup target filename
     timestamp=$(date +%Y%m%d)
+    
+    #Set to true if starting incremental backup
+    backup_incremental="false"
+
+    #Set true if Logical volume to snapshot before backup
+    lv_to_snap="false"
 
     # Destination where you want to store your backups
     backup_destination="/var/backups"

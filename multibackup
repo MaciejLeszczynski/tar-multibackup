@@ -18,7 +18,9 @@ color_red=$(tput setaf 1)
 color_yellow=$(tput setaf 3)
 color_green=$(tput setaf 2)
 color_reset=$(tput sgr0)
-
+#added to mimic booleans
+true=0
+false=1
 # Logging prefix helper
 prefix(){
   # Check if placeholders variables are given
@@ -114,37 +116,92 @@ total_tasks="${#folders_to_backup[@]}"
 
 # Iterate through "$folders_to_backup"
 for folder_to_backup in "${folders_to_backup[@]}"; do
-  # Check if folder exists
-  debug "Check if source folder \"${folder_to_backup}\" exists..."
+  original_folder_name=${folder_to_backup}
+  # Check if folder exists and snapshot to be made
+  debug "Check if source folder \"${original_folder_name}\" exists..."
+  if [[ -d "${original_folder_name}" && "${lv_to_snap}" -eq 0 ]]; then
+  mountpoint=$(df --output='source' $folder_to_backup|awk '{if(NR>1)print}')
+  lvname=$(lvdisplay -C -o "lv_name" $mountpoint --noheadings|sed -e 's/^[[:space:]]*//')
+  vgname=$(lvdisplay -C -o "vg_name" $mountpoint --noheadings|sed -e 's/^[[:space:]]*//')
+  lvpath=$(lvdisplay -C -o "lv_path" $mountpoint --noheadings|sed -e 's/^[[:space:]]*//')
+  lvsnapname=$(echo -e ${lvname}_snap | tr -d '[:space:]' )
+  lvcreate -L $(lvs  ${lvpath} -o LV_SIZE --noheadings --units G --nosuffix) -s -n $lvsnapname $vgname/$lvname
+  mkdir -p /${lvsnapname} && mount -o nouuid /dev/mapper/$vgname-$lvsnapname /${lvsnapname}
+  folder_to_backup=/${lvsnapname}
+  else
+  folder_to_backup=${folder_to_backup}
+  fi
+
   if [[ -d "${folder_to_backup}" ]]; then
     # Exist => continue
-    info "Source folder \"${folder_to_backup}\" exists!"
+    info "Source folder \"${original_folder_name}\" exists!"
     # Make sure backup destination exists
-    backup_basename=$(replace_slash_with_dash "${folder_to_backup}")
+    backup_basename=$(replace_slash_with_dash "${original_folder_name}")
     absolute_backup_destination=$(strip_duplicate_slashes_in_path "${backup_destination}/${backup_basename}")
+    snapshot_file="${backup_destination}/${backup_basename}/snapshotfile.sctl"
     if [[ ! -d "${absolute_backup_destination}" ]]; then
       info "Backup destination folder \"${absolute_backup_destination}\" doesn't exist. Creating..."
       mkdir -p "${absolute_backup_destination}"
     fi
 
     # Check if backup already exists (to make sure)
-    if [[ -f "${absolute_backup_destination}/${timestamp}.tar.gz" ]]; then
+    if [[ -f "${absolute_backup_destination}/${timestamp}.tar.gz" && ${lv_to_snap} -eq 0 ]]; then
+      error "Backup \"${absolute_backup_destination}/${timestamp}.tar.gz\" already exists. Skipping..."
+      umount /${lvsnapname}
+      rm -rf /${lvsnapname}
+      lvremove $vgname/$lvsnapname -y
+    elif [[ -f "${absolute_backup_destination}/${timestamp}.tar.gz" ]]; then
       error "Backup \"${absolute_backup_destination}/${timestamp}.tar.gz\" already exists. Skipping..."
     else
-      # Start backup
-      info "Starting backup \"${absolute_backup_destination}/${timestamp}.tar.gz\""
-      tar czf "${absolute_backup_destination}/${timestamp}.tar.gz" -P "${folder_to_backup}" "${tar_exclude_parameters[@]}"
+      # Customized for incremental functionality
+      # Timestamps for comparison
+      current_time=`date +%s`
+      if [ -f "$snapshot_file" ]; then
+        snap_file_time=$(stat --format='%Z' "$snapshot_file")
+      else
+        snap_file_time=$(($current_time - ( 60 * 60 * 24 * $backup_retention+1 )))
+      fi
+
+      if [[ ${backup_incremental} -eq 0 && $snap_file_time -gt $(( $current_time - ( 60 * 60 * 24 * $backup_retention ) )) ]]; then
+        # Starting incremental backup level 1 as snapshot is younger then retention policy
+        info "Starting incremental backup level 1 \"${absolute_backup_destination}/${timestamp}.tar.gz\""
+        tar --no-check-device -czvg ${snapshot_file} -f "${absolute_backup_destination}/${timestamp}.tar.gz" -P "${folder_to_backup}" "${tar_exclude_parameters[@]}"
+      elif  [[ ${backup_incremental} -eq 0 && $snap_file_time -le $(( $current_time - ( 60 * 60 * 24 * $backup_retention ) )) ]]; then
+        info "Starting incremental backup level 0 as retention time passed\"${absolute_backup_destination}/${timestamp}.tar.gz\""
+        rm -rf "${absolute_backup_destination}/${snapshot_file}"
+        tar --no-check-device -czvg "${snapshot_file}" -f "${absolute_backup_destination}/${timestamp}.tar.gz" -P "${folder_to_backup}" "${tar_exclude_parameters[@]}"
+      elif [[ ${backup_incremental} -ne 0 ]]; then
+      # Start full backup
+        info "Starting backup \"${absolute_backup_destination}/${timestamp}.tar.gz\""
+        tar -czf "${absolute_backup_destination}/${timestamp}.tar.gz" -P "${folder_to_backup}" "${tar_exclude_parameters[@]}"
+      fi
+
       if [[ $? -eq 0 ]]; then
-        success "Backup \"${absolute_backup_destination}/${timestamp}.tar.gz\" successfully completed!"
+        if [[ ${lv_to_snap} -eq 0 && ${backup_incremental} -eq 0 ]]; then
+          success "Incremental backup with snapshot \"${absolute_backup_destination}/${timestamp}.tar.gz\" successfully completed!"
+          umount /${lvsnapname}
+          rm -rf /${lvsnapname}
+          lvremove $vgname/$lvsnapname -y
+        elif [[ ${lv_to_snap} -eq 0 && ${backup_incremental} -ne 0 ]]; then
+          success "Backup with snapshot \"${absolute_backup_destination}/${timestamp}.tar.gz\" successfully completed!"
+          umount /${lvsnapname}
+          rm -rf /${lvsnapname}
+          lvremove $vgname/$lvsnapname -y
+        else 
+          success "Full Backup \"${absolute_backup_destination}/${timestamp}.tar.gz\" successfully completed!"
+        fi
       else
         error "Backup \"${absolute_backup_destination}/${timestamp}.tar.gz\" failed..."
       fi
     fi
 
     # Remove old backups
-    if [[ ! -z "${backup_retention}" ]]; then
-      find "${absolute_backup_destination}/" -maxdepth 1 -mtime "${backup_retention}" -type f -exec rm -rf {} \;
+    if [[ ! -z "${backup_retention}" && "$backup_incremental" -ne 0 ]]; then
+      find "${absolute_backup_destination}/" -maxdepth 1 -ctime "${backup_retention}" -type f -exec rm -rf {} \;
+    elif [[ ! -z "${backup_retention}" && "$backup_incremental" -eq 0 ]]; then
+      find "${absolute_backup_destination}/" -maxdepth 1 -ctime $(( "${backup_retention}"+1 )) -type f -exec rm -rf {} \;
     fi
+
   else
     # Doesn't exist => skip
     error "Folder \"${folder_to_backup}\" doesn't exist. Skipping..."
